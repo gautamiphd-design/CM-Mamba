@@ -47,7 +47,6 @@ class MambaBlock(tf.keras.layers.Layer):
         self.d_model = input_shape[-1]
         self.d_inner = int(self.expand * self.d_model)
 
-        # Layers
         self.norm = LayerNormalization()
         self.in_proj = Dense(self.d_inner * 2)
         self.conv1d = Conv1D(self.d_inner, self.d_conv, padding='same', groups=self.d_inner)
@@ -58,7 +57,7 @@ class MambaBlock(tf.keras.layers.Layer):
 
         self.out_proj = Dense(self.d_model)
 
-        # SSM parameters
+        # Initialize A matrix (SSM)
         A = tf.range(1, self.d_state + 1, dtype=tf.float32)
         A = tf.tile(tf.expand_dims(A, 0), [self.d_inner, 1])
 
@@ -74,21 +73,15 @@ class MambaBlock(tf.keras.layers.Layer):
             trainable=True
         )
 
-        # Gating
+        # Gating + residual scaling
         self.gate = ChannelSpatialGating(self.d_inner, self.dropout_rate)
-
-        # Residual scaling
-        self.alpha = self.add_weight(
-            shape=(),
-            initializer="ones",
-            trainable=True
-        )
+        self.alpha = self.add_weight(shape=(), initializer="ones", trainable=True)
 
         super().build(input_shape)
 
-    # ---------------------------------------------------
-    # FULL SSM FUNCTION (core Mamba logic)
-    # ---------------------------------------------------
+    # -------------------------------
+    # SSM Core
+    # -------------------------------
     def ssm(self, x):
         A = -tf.exp(self.A_log)
         D = self.D
@@ -116,9 +109,9 @@ class MambaBlock(tf.keras.layers.Layer):
 
         return y
 
-    # ---------------------------------------------------
+    # -------------------------------
     # Forward pass
-    # ---------------------------------------------------
+    # -------------------------------
     def call(self, x, training=None):
         x_res = x
         x = self.norm(x)
@@ -127,14 +120,9 @@ class MambaBlock(tf.keras.layers.Layer):
         x_feat, x_gate = tf.split(x_proj, 2, axis=-1)
 
         x_conv = tf.nn.silu(self.conv1d(x_feat))
-
-        # Apply gating
         x_gated = self.gate(x_conv, training=training)
 
-        # Apply SSM
         y_ssm = self.ssm(x_gated)
-
-        # Final gating
         y = y_ssm * tf.nn.silu(x_gate)
         y = self.out_proj(y)
 
@@ -142,7 +130,7 @@ class MambaBlock(tf.keras.layers.Layer):
 
 
 # ---------------------------------------------------
-# Final Model
+# Final Model with Positional Encoding
 # ---------------------------------------------------
 def create_model(input_shape=(224,224,3), num_classes=3):
 
@@ -157,14 +145,26 @@ def create_model(input_shape=(224,224,3), num_classes=3):
     x = LayerNormalization()(x)
     x = Activation('gelu')(x)
 
-    # Sequence conversion
+    # Convert to sequence
     x = Rearrange('b h w c -> b (h w) c')(x)
 
-    # Mamba blocks
+    # -------------------------------
+    # Positional Encoding (FIXED)
+    # -------------------------------
+    num_patches = x.shape[1]
+    positions = tf.range(start=0, limit=num_patches, delta=1)
+    pos_embed_layer = Embedding(input_dim=num_patches, output_dim=64)
+    pos_embed = pos_embed_layer(positions)
+
+    x = x + pos_embed
+
+    # -------------------------------
+    # Mamba Blocks
+    # -------------------------------
     for _ in range(4):
         x = MambaBlock()(x)
 
-    # Classifier
+    # Classification head
     x = GlobalAveragePooling1D()(x)
     x = Dense(128, activation='gelu')(x)
     x = Dropout(0.3)(x)
@@ -172,4 +172,3 @@ def create_model(input_shape=(224,224,3), num_classes=3):
     outputs = Dense(num_classes, activation='softmax')(x)
 
     return Model(inputs, outputs)
-    Model.summary() 
